@@ -140,6 +140,10 @@ class Account:
         yield self._rpc.add_transport_from_qr.future(self.id, qr)
 
     @futuremethod
+    def add_pseudo_transport(self, addr: str):
+        yield self._rpc.add_pseudo_transport.future(self.id, addr)
+
+    @futuremethod
     def init_transports(self, qr: Optional[str] = None):
         """Add an initial transport on the chatmail relay that answers fastest.
 

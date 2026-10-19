@@ -16,8 +16,7 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure, format_err};
 use async_channel::{self, Receiver, Sender};
 use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
-use futures::{FutureExt as _, TryStreamExt};
-use futures_lite::FutureExt;
+use futures::TryStreamExt as _;
 use ratelimit::Ratelimit;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -274,17 +273,23 @@ impl Imap {
                 "IMAP got rate limited, waiting for {} until can connect.",
                 duration_to_str(ratelimit_duration),
             );
-            let interrupted = async {
-                tokio::time::sleep(ratelimit_duration).await;
-                false
-            }
-            .race(self.idle_interrupt_receiver.recv().map(|_| true))
-            .await;
-            if interrupted {
-                info!(
-                    context,
-                    "Connecting to IMAP without waiting for ratelimit due to interrupt."
-                );
+            match tokio::time::timeout(ratelimit_duration, self.idle_interrupt_receiver.recv())
+                .await
+            {
+                Ok(Ok(())) => {
+                    info!(
+                        context,
+                        "Connecting to IMAP without waiting for ratelimit due to interrupt."
+                    );
+                }
+                Ok(Err(async_channel::RecvError)) => {
+                    // IMAP loop is likely shutting down and will be cancelled immediately afterwards.
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    bail!("Not connecting to IMAP because interrupt channel is closed");
+                }
+                Err(_) => {
+                    // Timeout expired.
+                }
             }
         }
 
@@ -301,6 +306,13 @@ impl Imap {
         self.conn_backoff_ms = max(BACKOFF_MIN_MS, self.conn_backoff_ms);
 
         let login_params = prioritize_server_login_params(&context.sql, &self.lp, "imap").await?;
+        if login_params.is_empty() {
+            self.connectivity.set_idle(context);
+
+            // Count one connection attempt so we don't busy loop.
+            self.ratelimit.send();
+        }
+
         let mut first_connection_error = None;
         let mut first_login_error = None;
         'candidate: for lp in login_params {
